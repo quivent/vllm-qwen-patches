@@ -1,110 +1,153 @@
 # vllm-qwen-patches
 
-Bug fixes for vLLM 0.19.0 speculative decoding with Qwen 3.5-27B.
+Bug fixes for vLLM 0.19.0 speculative decoding with Qwen 3.5-27B on NVIDIA GH200.
 
-8 bugs found across 3 files. Each patch is independent and can be applied separately.
+11 bugs found across 6 files. Each patch is independent.
 
-## Quick start
+## Setup
 
 ```bash
 git clone https://github.com/quivent/vllm-qwen-patches
 cd vllm-qwen-patches
 chmod +x apply.sh
-
-# Check your vLLM installation
 ./apply.sh check
-
-# Apply the safe patches (eagle + qwen3_next)
-./apply.sh all
-
-# Or apply individually
-./apply.sh eagle
-./apply.sh qwen3_next
-
-# Revert everything
-./apply.sh revert
 ```
 
 ## Patches
 
-### `eagle` — 5 fixes for tree speculation with MTP on multimodal models
+### 1. `eagle` — Tree speculation for multimodal MTP models
 
 **File:** `vllm/v1/spec_decode/eagle.py`
+**Bugs:** 5
 
-Enables `propose_tree()` on Qwen3_5ForConditionalGeneration (multimodal variant with M-RoPE).
+| Fix | Description |
+|-----|-------------|
+| positions device | `self.positions.device` crashes on M-RoPE models |
+| positions write | `self.positions[:n] = ...` crashes same way |
+| positions read | `positions=self.positions[:n]` crashes same way |
+| tuple unpack | Unconditional tuple unpack breaks MTP (single tensor return) |
+| MRoPE 1D | Positions assumed 1D but M-RoPE gives `(3, batch)` |
 
-| # | Bug | Impact |
-|---|---|---|
-| 1 | `self.positions.device` crashes — attribute doesn't exist on M-RoPE models | Server crash on tree spec config |
-| 2 | `self.positions[:n] = ...` same crash | Server crash during drafting |
-| 3 | `positions=self.positions[:n]` same crash | Server crash during drafting |
-| 4 | Unconditional tuple unpack of model output | Crash with MTP models (return single tensor, not tuple) |
-| 5 | Positions assumed 1D but M-RoPE gives `(3, batch)` | Tensor shape mismatch in tree position math |
+```bash
+./apply.sh eagle                    # apply
+./apply.sh revert eagle             # rollback
+```
 
-**Apply:** `./apply.sh eagle`
+**Test:**
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /path/to/model --speculative-model "[mtp]" \
+    --speculative-token-tree "[(0,),(1,),(2,)]" \
+    --attention-backend TREE_ATTN --enforce-eager \
+    --port 8002 &
+curl -s localhost:8002/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"model","messages":[{"role":"user","content":"test"}],"max_tokens":10}'
+```
 
-**Safe to apply:** Yes. Only affects tree speculation code path. Standard MTP chain is unaffected.
-
-### `qwen3_next` — tensor shape fix for modal_mtp
+### 2. `qwen3_next` — Tensor shape fix for modal_mtp
 
 **File:** `vllm/model_executor/models/qwen3_next.py`
+**Bugs:** 1
 
 Fixes IndexError when modal_mtp toggles between `input_ids` and `inputs_embeds` in the compiled forward pass.
 
-**Apply:** `./apply.sh qwen3_next`
+```bash
+./apply.sh qwen3_next               # apply
+./apply.sh revert qwen3_next        # rollback
+```
 
-**Safe to apply:** Yes. Only affects the modal_mtp draft code path.
-
-### `speculative` — allow standalone draft models for Qwen 3.5
+### 3. `speculative` — Standalone draft model support
 
 **File:** `vllm/config/speculative.py`
+**Bugs:** 1
 
-Guards `hf_config_override()` so standalone Qwen 3.5 draft models aren't forced into MTP extraction mode. Without this, `--speculative-config '{"method": "draft_model", "model": "/path/to/draft"}'` fails for any model with `model_type == "qwen3_5"`.
+Guards `hf_config_override()` so standalone Qwen 3.5 draft models aren't forced into MTP extraction mode.
 
-**Apply:** `./apply.sh speculative`
-
-**Safe to apply:** Use with caution. This changes MTP detection logic. Test your specific config after applying.
-
-### `modal_mtp` — DeltaNet self-speculative proposer
-
-**File:** `vllm/v1/spec_decode/modal_mtp.py` (new file)
-
-Self-speculative decoding using the main model's DeltaNet linear attention layers for drafting. 3 bugs fixed from the original implementation.
-
-**Apply:** `./apply.sh modal_mtp`
-
-**Known issue:** DeltaNet recurrent state is corrupted by draft forwards without snapshot/restore (40GB memory cost). Draft acceptance rate drops to 0% after the first request. Not production-ready — research only.
-
-## Which patches does your friend need?
-
-**Running Qwen 3.5 with standard MTP speculation?**
-No patches needed. Stock vLLM 0.19.0 works fine for the default `qwen3_5_mtp` method.
-
-**Want tree speculation (branching draft candidates)?**
-Apply `eagle`. Then use `--attention-backend TREE_ATTN --enforce-eager` with a `speculative_token_tree` config.
-
-**Want to use a separate draft model (not MTP head)?**
-Apply `eagle` + `speculative`.
-
-**Want DeltaNet self-speculative (experimental)?**
-Apply all four: `eagle` + `qwen3_next` + `speculative` + `modal_mtp`.
-
-## Verify
-
-After patching, verify syntax:
 ```bash
-python3 -c "
-import py_compile
-py_compile.compile('$(python3 -c \"import vllm; print(vllm.__path__[0])\")/v1/spec_decode/eagle.py', doraise=True)
-print('OK')
-"
+./apply.sh speculative              # apply
+./apply.sh revert speculative       # rollback
 ```
+
+**Test:**
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /path/to/main \
+    --speculative-config '{"method":"draft_model","model":"/path/to/draft","num_speculative_tokens":5}' \
+    --port 8002 &
+```
+
+### 4. `gdn` — DeltaNet shadow state for modal_mtp
+
+**File:** `vllm/model_executor/layers/mamba/gdn_linear_attn.py`
+**Bugs:** 1
+
+GDN layers check `_draft_kv_cache` attribute before writing to real cache. Draft forwards write to a shadow cache instead.
+
+```bash
+./apply.sh gdn                      # apply
+./apply.sh revert gdn               # rollback
+```
+
+### 5. `qwen3_5` — Shadow state setup/clear
+
+**File:** `vllm/model_executor/models/qwen3_5.py`
+**Bugs:** 1
+
+Adds `setup_draft_shadow_state()` and `clear_draft_shadow_state()` to Qwen3_5Model. Required by modal_mtp with the gdn patch.
+
+```bash
+./apply.sh qwen3_5                  # apply
+./apply.sh revert qwen3_5           # rollback
+```
+
+### 6. `gpu_model_runner` — CUDA graph + tree attention fix
+
+**File:** `vllm/v1/worker/gpu_model_runner.py`
+**Bugs:** 1
+
+Downgrades CUDA graph mode from PIECEWISE to NONE when TREE_ATTN backend is used with speculative decoding. Prevents segfault during graph replay with tree-shaped attention metadata.
+
+```bash
+./apply.sh gpu_model_runner          # apply
+./apply.sh revert gpu_model_runner   # rollback
+```
+
+## Apply/Revert
+
+```bash
+# Apply individual patch
+./apply.sh eagle
+
+# Apply safe patches (eagle + qwen3_next only)
+./apply.sh all
+
+# Check patch state
+./apply.sh check
+
+# Revert ONE patch (extracts clean file from pip wheel)
+./apply.sh revert eagle
+
+# Revert ALL patches to stock (nuclear option, extracts from wheel)
+./apply.sh revert
+
+# The revert command also:
+#   - Removes non-stock files (modal_mtp.py, etc.)
+#   - Clears torch compile cache
+```
+
+## Safety
+
+- `./apply.sh revert` extracts clean files directly from the installed pip wheel — it does NOT rely on `.bak` files
+- Each patch only touches ONE file
+- Standard MTP speculative decoding (`qwen3_5_mtp` method) works without any patches
+- Patches are only needed for tree speculation, modal_mtp, or standalone draft models
 
 ## Tested on
 
 - vLLM 0.19.0 (`vllm-0.19.0-cp38-abi3-manylinux_2_31_aarch64.whl`)
 - NVIDIA GH200 480GB
-- Qwen 3.5-27B W4A16 (Huihui-abliterated)
+- Qwen 3.5-27B W4A16
 - CUDA 13.0, Python 3.10
 
 ## License
