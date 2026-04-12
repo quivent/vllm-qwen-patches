@@ -27,9 +27,29 @@ not converging to a fixed point when the input changes each iteration. Multiple
 loops = the model has "thought about it, thought about thinking about it."
 Cost scales linearly (~2.4ms per loop) but state enrichment compounds.
 
+### What we proved
+- GDN-only thinking (skip attention) runs 1.7x faster (14.1 vs 8.3 tok/s on GH200)
+- Two-phase generation (30 tok think + 120 tok respond) = 0.69x baseline time
+- Post-prefill GDN cycling updates state in-place (hidden_states untouched)
+- BUT: naive injection into vLLM's forward loop breaks MTP acceptance (51% → 34%)
+
+### The correct implementation
+The GDN cycle must happen BETWEEN prefill and first decode — not inside the forward pass.
+
+```
+Request → Prefill (full 64 layers) → GDN inhibition cycle (48 recurrence kernels, ~2.4ms)
+→ Generate response (full 64 layers, MTP=5, all optimizations intact)
+```
+
+This requires a new execution phase in vLLM's scheduler — not a forward pass hack.
+The recurrence kernels update GDN state in-place without touching hidden_states,
+so MTP calibration is preserved. The model "pauses to think" for 2.4ms before speaking.
+
 ### Next steps
-- Implement option 1 as a one-line addition in vLLM's model forward (after final norm)
-- Needs careful gating: only during decode, not prefill/verify, don't modify logits
+- Implement as a vLLM scheduler phase (between prefill and decode)
+- The GDN recurrence kernel (`fused_sigmoid_gating_delta_rule_update`) runs standalone
+- State updated in-place in the cache; no hidden_states modification
+- GDN-only thinking tokens as an alternative: skip attention during think phase
 - Train GDN layers (LoRA) to use the enriched state effectively
 
 ---
