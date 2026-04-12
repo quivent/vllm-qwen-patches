@@ -31,6 +31,7 @@ Baseline: **186 tok/s** (stock vLLM, MTP spec=7, batch=1, GH200)
 | 4 | `gdn` | `model_executor/layers/mamba/gdn_linear_attn.py` | 1 | DeltaNet state corruption during draft forwards |
 | 5 | `qwen3_5` | `model_executor/models/qwen3_5.py` | 1 | Missing shadow state methods for modal\_mtp |
 | 6 | `gpu_model_runner` | `v1/worker/gpu_model_runner.py` | 1 | CUDA graph segfault with tree attention |
+| 7 | `rollback` | `gdn_linear_attn.py` + `qwen3_5.py` | 0 | O(1) GDN state rollback for MTP spec decode |
 
 ## Usage
 
@@ -47,6 +48,38 @@ chmod +x apply.sh
 ```
 
 Revert extracts clean files from the pip wheel, not `.bak` files. Also clears torch compile cache.
+
+## Recurrent-Rollback (Patch 7)
+
+Qwen3.5-27B has 48 DeltaNet (GDN) layers whose recurrence state is non-invertible:
+
+```
+S_{t+1} = g_t * S_t + beta_t * k_t * (v_t - k_t^T @ S_t)
+```
+
+The `k_t^T @ S_t` retrieval makes the update state-dependent. When MTP speculative decoding rejects at position K, you cannot algebraically undo the state updates to recover `S_K` from `S_N`. The standard approach is to checkpoint the full state before verification and recompute the forward pass for accepted tokens on rejection -- this costs ~8.7ms per step at 51% rejection rate.
+
+The recurrent-rollback patch saves `.clone()` snapshots of both ssm_state and conv_state at each speculative position during the verification forward pass. On rejection, it restores the correct state with a single `.copy_()` per layer -- O(1) instead of O(K) recomputation.
+
+**Memory cost**: 48 layers x 6 positions x ~3.1 MB/checkpoint = ~893 MB. Checkpoints are only allocated during verification passes, not during normal generation.
+
+**Timing** (GH200, measured):
+- Rollback: 0.85 ms (48 layers, one `.copy_()` each)
+- Checkpoint save: 4.8 ms total (48 layers x 5 positions)
+- Eliminated recomputation: ~8.7 ms expected per step
+
+**Net savings**: ~3.1 ms per verification step.
+
+API:
+```python
+model.setup_rollback_manager(max_positions=6)  # once at init
+model.begin_verification()                      # before verify forward
+logits = model.forward(draft_tokens)            # auto-saves checkpoints
+model.rollback_gdn_state(K - 1, state_index=slot_id)  # on rejection
+model.end_verification()                        # release memory
+```
+
+Based on the [recurrent-rollback technique](https://github.com/quivent/recurrent-rollback) (originally implemented for MLX). The PyTorch version uses explicit `.clone()` instead of MLX's zero-cost immutable array references.
 
 ## Hardware
 

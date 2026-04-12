@@ -57,6 +57,7 @@ declare -A PATCH_FILES=(
     [gdn]="vllm/model_executor/layers/mamba/gdn_linear_attn.py"
     [qwen3_5]="vllm/model_executor/models/qwen3_5.py"
     [gpu_model_runner]="vllm/v1/worker/gpu_model_runner.py"
+    [rollback]="vllm/model_executor/layers/mamba/gdn_linear_attn.py"
 )
 
 declare -A PATCH_DESC=(
@@ -66,6 +67,7 @@ declare -A PATCH_DESC=(
     [gdn]="DeltaNet shadow state for modal_mtp draft mode"
     [qwen3_5]="shadow state setup/clear methods for modal_mtp"
     [gpu_model_runner]="CUDA graph segfault fix for TREE_ATTN + spec decode"
+    [rollback]="O(1) GDN state rollback for MTP spec decode verification"
 )
 
 apply_patch() {
@@ -97,6 +99,10 @@ apply_patch() {
         qwen3_5)
             cd "$VLLM_ROOT" && patch -p1 --forward < "$SCRIPT_DIR/qwen3_5-shadow-state.patch"
             echo "  applied: $name"
+            ;;
+        rollback)
+            cd "$VLLM_ROOT" && patch -p0 --forward < "$SCRIPT_DIR/recurrent-rollback.patch"
+            echo "  applied: $name (gdn_linear_attn.py + qwen3_5.py)"
             ;;
         *)
             echo "error: no patch procedure for '$name'"
@@ -174,7 +180,7 @@ case "${1:-list}" in
     list)
         echo ""
         echo "Available patches:"
-        for name in eagle qwen3_next speculative gdn qwen3_5 gpu_model_runner; do
+        for name in eagle qwen3_next speculative gdn qwen3_5 gpu_model_runner rollback; do
             echo "  $name — ${PATCH_DESC[$name]}"
         done
         echo ""
@@ -182,7 +188,7 @@ case "${1:-list}" in
         ;;
     check)
         echo "version: $VLLM_VERSION"
-        for name in eagle qwen3_next speculative gdn qwen3_5 gpu_model_runner; do
+        for name in eagle qwen3_next speculative gdn qwen3_5 gpu_model_runner rollback; do
             local file="${PATCH_FILES[$name]}"
             local target="$VLLM_ROOT/$file"
             if [ -f "$target.bak" ]; then
