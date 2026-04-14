@@ -33,6 +33,12 @@ Baseline: **186 tok/s** (stock vLLM, MTP spec=7, batch=1, GH200)
 | 6 | `gpu_model_runner` | `v1/worker/gpu_model_runner.py` | 1 | CUDA graph segfault with tree attention |
 | 7 | `rollback` | `gdn_linear_attn.py` + `qwen3_5.py` | 0 | O(1) GDN state rollback for MTP spec decode |
 
+## GH200 Quick Start
+
+Full agent-executable install guide: **[docs/08-GH200-AGENT-INSTALL.md](docs/08-GH200-AGENT-INSTALL.md)**
+
+Sets up vLLM in a venv, downloads the model, applies all patches (eagle + qwen3_next + recurrent-rollback), and launches with MTP=5. Every step has a verification command. No decisions required.
+
 ## Usage
 
 ```bash
@@ -43,6 +49,7 @@ chmod +x apply.sh
 ./apply.sh check          # show vLLM version and patch state
 ./apply.sh eagle          # apply one patch
 ./apply.sh all            # apply safe patches (1 + 2)
+./apply.sh rollback       # apply recurrent-rollback (patch 7)
 ./apply.sh revert         # restore ALL files to stock from pip wheel
 ./apply.sh revert eagle   # restore one file to stock
 ```
