@@ -3,12 +3,63 @@
 For a standard Linux machine (Ubuntu, Lambda Stack, etc.) — NOT NixOS.
 NixOS needs the extra workarounds in `05-NIXOS-GUIDE.md`.
 
+## TL;DR — use `deploy.sh`
+
+The whole pipeline is wrapped in `../deploy.sh` (sibling of `apply.sh` in this repo). It handles every gotcha below. On a fresh GH200 box:
+
+```bash
+./deploy.sh all                      # env + pull + prep (≈ 8 min)
+nohup ./deploy.sh launch > vllm.log 2>&1 &
+                                     # first launch ≈ 3–5 min JIT; cached afterwards
+./deploy.sh smoke                    # sanity check + MTP acceptance rate
+```
+
+Env overrides: `VENV`, `MODEL_DIR`, `HF_REPO`, `PORT`, `NUM_SPEC_TOKENS`, `HF_TOKEN`. See the header of `deploy.sh`.
+
+### Known-good result on GH200 (Apr 2026)
+
+| Metric | Value |
+|---|---|
+| Model | `j-a-a-a-y/Qwen3.5-27B-AWQ-4bit-textonly` |
+| Config | `num_speculative_tokens=5`, `dtype=float16`, `max_num_seqs=4`, `max_num_batched_tokens=1024` |
+| Single-request tok/s | **~192** (range 185–202) |
+| TTFT (p90) | ~80 ms |
+| MTP acceptance | **55.5%** overall |
+| MTP acceptance per draft position | 85% / 68% / 54% / 40% / 31% |
+
+If your numbers are materially worse, start from the gotchas table below — #1 (CPU torch) and #5 (wrong model) account for most 3× misses.
+
+
+## Gotchas — read this first
+
+Failures we've hit and their fixes, in the order you're likely to hit them:
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| 1 | `pip install vllm` pulls `torch-2.10.0+cpu` on GH200; `torch.cuda.is_available() == False` | aarch64 + vllm's default torch wheel resolves to CPU-only | `pip install --force-reinstall torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128` |
+| 2 | Engine exits during `profile_cudagraph_memory` with `FileNotFoundError: 'ninja'` | flashinfer JIT needs `ninja` binary, not just the Python package | `apt-get install -y ninja-build` (or ensure venv `bin` on PATH) |
+| 3 | Server sits silent for 3–5 min on first launch after "torch.compile took X s" | flashinfer JIT-compiles ~32 GDN prefill kernel variants on first run | Expected, one-time; cached under `~/.cache/flashinfer/`. Skip with `--gdn-prefill-backend triton` if you can't wait. |
+| 4 | `RuntimeError: Cannot find any model weights` on `-textonly` repos | HF repo ships single `model.safetensors` but stale `model.safetensors.index.json` points to 4 shards | Rewrite the index — see snippet below Step 2 |
+| 5 | `/metrics` shows `spec_decode_num_accepted_tokens_total / num_draft_tokens_total ≈ 0%` → tok/s ~1/3 of expected | Using `j-a-a-a-y/Qwen3.5-27B-AWQ-4bit-retrained-mtp` — the retrained draft head was abandoned and ships with broken weight mapping (see warnings `Parameter layers.0.mlp.down_proj.weight not found in params_dict`) | Switch to `j-a-a-a-y/Qwen3.5-27B-AWQ-4bit-textonly` (stock MTP, works) |
+| 6 | Stripping vision with the script below erases the freshly-written safetensors index | Original copy-loop didn't exclude `model.safetensors.index.json` | Snippet below already fixed — keep the `.index.json` in the skip list |
+| 7 | You're tempted to apply step 5 (INT8 embedding patch) on a GH200 | It's only for low-VRAM GPUs (RTX 5090 24 GB etc.) | Skip step 5 entirely on GH200 / A6000 / H100 |
+
+**Validation checklist after launch:**
+
+1. `curl -s http://localhost:8001/v1/models` returns your model.
+2. `curl -s http://localhost:8001/metrics | grep spec_decode_num_accepted` — acceptance/(accepted+drafts) should be **≥ 40%**. If it's near zero, you're on the wrong model.
+3. Run `bench-tok-s.py` — single-request throughput should be ~150–190 tok/s on GH200.
+
 ## Requirements
 
-- NVIDIA GPU with 24+ GB VRAM (RTX 3090/4090/5090, A5000, A6000, etc.)
+- NVIDIA GPU with 24+ GB VRAM (RTX 3090/4090/5090, A5000, A6000, GH200, etc.)
 - CUDA 12.x drivers installed
 - Python 3.10+
 - ~25 GB disk for model + vLLM
+
+> **Note on step 5 (INT8 embedding patch):** it exists to save ~1.3 GB VRAM on low-VRAM GPUs (e.g. RTX 5090, 24 GB cards). On GH200 (96 GB HBM) or A6000 (48 GB) it is **not needed** — skip step 5 entirely.
+
+> **Note on torch wheels:** on aarch64 (GH200 Grace CPU), `pip install vllm==0.19.0` may pull a CPU-only torch. Reinstall with `pip install --force-reinstall torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128` to get the CUDA build.
 
 ## Step 1: Install vLLM (2 minutes)
 
@@ -20,13 +71,38 @@ pip install vllm==0.19.0
 
 ## Step 2: Download model (5-10 minutes)
 
+**Canonical model: `j-a-a-a-y/Qwen3.5-27B-AWQ-4bit-textonly`** — W4A16 compressed-tensors 4-bit, vision already stripped, **stock working MTP head**. This is the one that hits ~186 tok/s baseline on GH200.
+
+> **Do NOT use `j-a-a-a-y/Qwen3.5-27B-AWQ-4bit-retrained-mtp`.** The retrained MTP draft head in that variant was abandoned and ships with broken/unmapped weights. vLLM loads it with warnings like `Parameter layers.0.mlp.down_proj.weight not found in params_dict, skip loading`, then runs the draft head with zero-initialized params, producing **~0% MTP acceptance** — spec decode then pays full 5× draft overhead for no gain, dropping tok/s by ~3×. Check `/metrics` for `vllm:spec_decode_num_accepted_tokens_total / num_draft_tokens_total` — if acceptance is below ~30%, you're on the wrong model.
+
+Alternates (all under the `j-a-a-a-y` HF account):
+- `Qwen3.5-27B-AWQ-4bit-textonly` ← **use this one**, vision stripped, stock MTP works
+- `Qwen3.5-27B-AWQ-4bit-retrained-mtp` ← **abandoned; do not use for inference**
+- `Huihui-Qwen3.5-27B-abliterated-{AWQ,GPTQ,CT}-W4A16` — abliterated variants (alt base)
+- `cyankiwi/Qwen3.5-27B-AWQ-4bit` — original community AWQ, still has vision
+
 ```bash
-pip install huggingface_hub
+pip install huggingface_hub hf_transfer
+export HF_HUB_ENABLE_HF_TRANSFER=1
+# export HF_TOKEN=hf_...  # only if pulling private variants
 python3 -c "
 from huggingface_hub import snapshot_download
-snapshot_download('cyankiwi/Qwen3.5-27B-AWQ-4bit', local_dir='/opt/models/Qwen3.5-27B-AWQ')
+snapshot_download('j-a-a-a-y/Qwen3.5-27B-AWQ-4bit-textonly', local_dir='/opt/models/Qwen3.5-27B-AWQ')
 "
 ```
+
+> **Fix the stale `model.safetensors.index.json`.** The `-textonly` HF repo ships a single consolidated `model.safetensors` but its `model.safetensors.index.json` still references four shard files that were never uploaded. vLLM fails startup with `RuntimeError: Cannot find any model weights with ...`. Rewrite the index before launching:
+>
+> ```bash
+> python3 -c "
+> import json, os
+> from safetensors import safe_open
+> p = '/opt/models/Qwen3.5-27B-AWQ/model.safetensors'
+> keys = list(safe_open(p, framework='pt').keys())
+> idx = {'metadata': {'total_size': os.path.getsize(p)}, 'weight_map': {k: 'model.safetensors' for k in keys}}
+> json.dump(idx, open('/opt/models/Qwen3.5-27B-AWQ/model.safetensors.index.json', 'w'), indent=2)
+> "
+> ```
 
 ## Step 3: Strip vision encoder (saves 0.92 GB VRAM)
 
@@ -61,7 +137,10 @@ with open(os.path.join(dst, 'config.json'), 'w') as f:
     json.dump(config, f, indent=2)
 
 for fn in os.listdir(src):
-    if fn.endswith('.safetensors') or fn == 'config.json': continue
+    # NOTE: must exclude model.safetensors.index.json — we just wrote a fresh one above
+    # that points to the single consolidated shard. Copying the source index back over it
+    # will make vLLM fail with "Cannot find any model weights".
+    if fn.endswith('.safetensors') or fn in ('config.json', 'model.safetensors.index.json'): continue
     s = os.path.join(src, fn)
     if os.path.isfile(s): shutil.copy2(s, dst)
 
@@ -157,6 +236,12 @@ python3 -m vllm.entrypoints.openai.api_server \
     --enable-prefix-caching \
     --limit-mm-per-prompt '{"image": 0, "video": 0}'
 ```
+
+> **First-launch warning — flashinfer GDN JIT compile (~3–5 min).** On the very first launch, flashinfer compiles ~32 CUDA kernel variants for the Gated DeltaNet (GDN) prefill path. The log sits silently at `torch.compile took X.XX s` for several minutes while `~/.cache/flashinfer/0.6.6/90a/cached_ops/gdn_prefill_sm90/` fills with `.cuda.o` objects. This is **expected, one-time, and cached** — subsequent launches start in ~30s.
+>
+> If you want to skip the JIT entirely, add `--gdn-prefill-backend triton` to the launch command (slightly slower prefill, no compile time).
+>
+> Also: the JIT needs a `ninja` binary on `PATH`. `pip install vllm` installs the `ninja` Python package, but not always the binary — `apt-get install -y ninja-build` is the safest bet. Without it the engine exits during `profile_cudagraph_memory` with `FileNotFoundError: 'ninja'`.
 
 ## Step 7: Test
 
